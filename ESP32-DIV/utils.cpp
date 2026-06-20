@@ -498,18 +498,46 @@ float readBatteryVoltage() {
   #if !defined(BATTERY_ADC_PIN) || (BATTERY_ADC_PIN < 0)
   return NAN;
   #else
-  const int sampleCount = 10;
-  long sum = 0;
-
-  for (int i = 0; i < sampleCount; i++) {
-    sum += analogRead(BATTERY_ADC_PIN);
+  static bool adcConfigured = false;
+  if (!adcConfigured) {
+    analogReadResolution(12);
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+    adcConfigured = true;
   }
 
-  float averageADC = sum / (float)sampleCount;
+  constexpr int sampleCount = 16;
+  int samples[sampleCount];
+  int collected = 0;
 
-  float pinVoltage = (averageADC / 4095.0f) * 3.3f;
+  for (int i = 0; i < sampleCount; i++) {
+    const int mv = analogReadMilliVolts(BATTERY_ADC_PIN);
+    if (mv > 0) {
+      samples[collected++] = mv;
+    }
+    delayMicroseconds(200);
+  }
 
-  float outputVoltage = pinVoltage * ((BATTERY_VDIV_R1 + BATTERY_VDIV_R2) / BATTERY_VDIV_R2);
+  if (collected <= 0) {
+    return NAN;
+  }
+
+  std::sort(samples, samples + collected);
+  int startIndex = 0;
+  int endIndex = collected;
+  if (collected >= 5) {
+    startIndex = 1;
+    endIndex = collected - 1;
+  }
+
+  long sum = 0;
+  for (int i = startIndex; i < endIndex; ++i) {
+    sum += samples[i];
+  }
+
+  const float averageMilliVolts = sum / (float)(endIndex - startIndex);
+  const float pinVoltage = averageMilliVolts / 1000.0f;
+  const float outputVoltage =
+      pinVoltage * ((BATTERY_VDIV_R1 + BATTERY_VDIV_R2) / BATTERY_VDIV_R2);
 
   return outputVoltage;
   #endif
@@ -572,6 +600,19 @@ static uint16_t statusBarRadioColor(StatusBarRadioState state, int count, uint16
   }
 }
 
+static int batteryVoltageToPercent(float batteryVoltage) {
+  if (!isfinite(batteryVoltage) || batteryVoltage <= 0.1f) {
+    return -1;
+  }
+
+  constexpr float kEmptyVoltage = 3.0f;
+  constexpr float kFullVoltage = 4.2f;
+  const float clampedVoltage = constrain(batteryVoltage, kEmptyVoltage, kFullVoltage);
+  const float rawPercent = ((clampedVoltage - kEmptyVoltage) * 100.0f) /
+                           (kFullVoltage - kEmptyVoltage);
+  return constrain((int)lroundf(rawPercent), 0, 100);
+}
+
 static void drawStatusBarUsbBatteryIcon(int x, int y, uint16_t color, uint16_t bg) {
   tft.fillRect(x, y, 26, 14, bg);
   tft.fillRoundRect(x, y + 1, 21, 12, 2, color);
@@ -600,11 +641,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
   static uint32_t lastWardBlinkPhase = 0;
 
   const bool batteryKnown = isfinite(batteryVoltage) && batteryVoltage > 0.1f;
-  int batteryPercentage = -1;
-  if (batteryKnown) {
-    batteryPercentage = ::map(batteryVoltage * 100, 300, 420, 0, 100);
-    batteryPercentage = constrain(batteryPercentage, 0, 100);
-  }
+  const int batteryPercentage = batteryVoltageToPercent(batteryVoltage);
 
   int wifiDevices = 0;
   int bleDevices  = 0;
