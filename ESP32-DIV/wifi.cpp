@@ -989,19 +989,130 @@ static void spamDrawToolbarStatus() {
 static uint8_t lastSpamChannel = 0xFF;
 static bool    lastSpamState   = !false;
 
-uint8_t packet[128] = {0x80, 0x00, 0x00, 0x00,
-                       0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                       0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                       0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                       0xc0, 0x6c,
-                       0x83, 0x51, 0xf7, 0x8f, 0x0f, 0x00, 0x00, 0x00,
-                       0x64, 0x00,
-                       0x01, 0x04,
-                       0x00, 0x06, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72,
-                       0x01, 0x08, 0x82, 0x84,
-                       0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c, 0x03, 0x01,
-                       0x04
-                      };
+static constexpr uint8_t kBeaconFrameTemplate[] = {
+  0x80, 0x00, 0x00, 0x00,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+  0xc0, 0x6c,
+  0x83, 0x51, 0xf7, 0x8f, 0x0f, 0x00, 0x00, 0x00,
+  0x64, 0x00,
+  0x01, 0x04,
+  0x00, 0x06, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72,
+  0x01, 0x08, 0x82, 0x84,
+  0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c, 0x03, 0x01,
+  0x04
+};
+
+static constexpr size_t kBeaconBaseLen = sizeof(kBeaconFrameTemplate);
+static constexpr size_t kBeaconBaseSsidLen = 6;
+static constexpr size_t kBeaconMaxSsidLen = 32;
+static constexpr size_t kBeaconSsidOffset = 38;
+static constexpr size_t kBeaconTailOffset = 44;
+static constexpr size_t kBeaconTailLen = kBeaconBaseLen - kBeaconTailOffset;
+
+static bool s_beaconRadioReady = false;
+
+static bool beaconRadioEnsureReady(uint8_t channel) {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  const esp_err_t modeErr = esp_wifi_get_mode(&mode);
+  if (s_beaconRadioReady && modeErr == ESP_OK) {
+    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+      Serial.printf("Channel set failed: %d\n", err);
+      return false;
+    }
+    err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
+      Serial.printf("Promiscuous set failed: %d\n", err);
+      return false;
+    }
+    return true;
+  }
+
+  if (modeErr == ESP_ERR_WIFI_NOT_INIT) {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) {
+      Serial.printf("WiFi init failed: %d\n", err);
+      return false;
+    }
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+      Serial.printf("Storage set failed: %d\n", err);
+      return false;
+    }
+  } else if (modeErr != ESP_OK) {
+    Serial.printf("WiFi mode query failed: %d\n", modeErr);
+    return false;
+  }
+
+  esp_err_t err = esp_wifi_set_mode(WIFI_MODE_AP);
+  if (err != ESP_OK) {
+    Serial.printf("Mode set failed: %d\n", err);
+    return false;
+  }
+
+  wifi_config_t ap_config = {};
+  strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
+  ap_config.ap.ssid_len = strlen("ESP32-DIV");
+  ap_config.ap.channel = channel;
+  ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  ap_config.ap.ssid_hidden = 1;
+  ap_config.ap.max_connection = 1;
+  ap_config.ap.beacon_interval = 100;
+  err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  if (err != ESP_OK) {
+    Serial.printf("AP config failed: %d\n", err);
+    return false;
+  }
+
+  if (modeErr == ESP_ERR_WIFI_NOT_INIT) {
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+      Serial.printf("WiFi start failed: %d\n", err);
+      return false;
+    }
+  }
+
+  err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  if (err != ESP_OK) {
+    Serial.printf("Channel set failed: %d\n", err);
+    return false;
+  }
+
+  err = esp_wifi_set_promiscuous(true);
+  if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
+    Serial.printf("Promiscuous set failed: %d\n", err);
+    return false;
+  }
+
+  s_beaconRadioReady = true;
+  return true;
+}
+
+static bool buildBeaconFrame(const String& ssid, uint8_t channel, uint8_t* frame,
+                             size_t frameSize, size_t& frameLen) {
+  const size_t ssidLen = min((size_t)ssid.length(), kBeaconMaxSsidLen);
+  const size_t requiredLen = kBeaconBaseLen + (ssidLen - kBeaconBaseSsidLen);
+  if (ssidLen < kBeaconBaseSsidLen || frameSize < requiredLen) {
+    return false;
+  }
+
+  memcpy(frame, kBeaconFrameTemplate, kBeaconSsidOffset);
+  frame[37] = (uint8_t)ssidLen;
+  memcpy(frame + kBeaconSsidOffset, ssid.c_str(), ssidLen);
+  memcpy(frame + kBeaconSsidOffset + ssidLen,
+         kBeaconFrameTemplate + kBeaconTailOffset,
+         kBeaconTailLen);
+  frame[kBeaconSsidOffset + ssidLen + kBeaconTailLen - 1] = channel;
+  frameLen = requiredLen;
+  return true;
+}
+
+static String randomBeaconSsidFromList() {
+  return ssidList[random(ssidCount)];
+}
 
 void handleLeftButton() {
   spamchannel = (spamchannel == 1) ? 14 : spamchannel - 1;
@@ -1079,47 +1190,25 @@ void output() {
 }
 
 void spammer() {
-  esp_wifi_set_channel(spamchannel, WIFI_SECOND_CHAN_NONE);
+  uint8_t frame[128];
+  size_t frameLen = 0;
+  String randomSSID = randomBeaconSsidFromList();
+  if (!buildBeaconFrame(randomSSID, spamchannel, frame, sizeof(frame), frameLen)) {
+    return;
+  }
 
   for (int i = 10; i <= 21; i++) {
-    packet[i] = random(256);
+    frame[i] = random(256);
   }
 
-  String randomSSID = ssidList[random(ssidCount)];
-  int ssidLength = randomSSID.length();
-  packet[37] = ssidLength;
-
-  for (int i = 0; i < ssidLength; i++) {
-    packet[38 + i] = randomSSID[i];
-  }
-
-  for (int i = 38 + ssidLength; i <= 43; i++) {
-    packet[i] = 0x00;
-  }
-
-  packet[56] = spamchannel;
-
-  esp_wifi_80211_tx(WIFI_IF_AP, packet, 57, false);
+  esp_wifi_set_channel(spamchannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_80211_tx(WIFI_IF_AP, frame, frameLen, false);
 
   delay(1);
 }
 
 void beaconSpam() {
-    String ssid = "1234567890qwertyuiopasdfghjkklzxcvbnm QWERTYUIOPASDFGHJKLZXCVBNM_";
     byte channel;
-
-    uint8_t packet[128] = { 0x80, 0x00, 0x00, 0x00,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                            0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                            0xc0, 0x6c,
-                            0x83, 0x51, 0xf7, 0x8f, 0x0f, 0x00, 0x00, 0x00,
-                            0x64, 0x00,
-                            0x01, 0x04,
-                            0x00, 0x06, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72,
-                            0x01, 0x08, 0x82, 0x84,
-                            0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c, 0x03, 0x01,
-                            0x04};
 
     tft.setTextFont(1);
     tft.setTextSize(1);
@@ -1137,68 +1226,34 @@ void beaconSpam() {
     maintainTouchNavBar();
 
     delay(500);
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t err = esp_wifi_init(&cfg);
-    if (err != ESP_OK) {
-        Serial.printf("WiFi init failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (err != ESP_OK) {
-        Serial.printf("Storage set failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (err != ESP_OK) {
-        Serial.printf("Mode set failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_start();
-    if (err != ESP_OK) {
-        Serial.printf("WiFi start failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_set_promiscuous(true);
-    if (err != ESP_OK) {
-        Serial.printf("Promiscuous set failed: %d\n", err);
-        return;
+    if (!beaconRadioEnsureReady(1)) {
+      return;
     }
 
     while (true) {
         channel = random(1, 13);
+        uint8_t frame[128];
+        size_t frameLen = 0;
+        String ssid = randomBeaconSsidFromList();
+        if (!buildBeaconFrame(ssid, channel, frame, sizeof(frame), frameLen)) {
+          continue;
+        }
+
+        for (int i = 10; i <= 21; i++) {
+            frame[i] = random(256);
+        }
+
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
-        for (int i = 10; i <= 15; i++) {
-            packet[i] = random(256);
-        }
-        for (int i = 16; i <= 21; i++) {
-            packet[i] = random(256);
-        }
-
-        packet[38] = ssid[random(65)];
-        packet[39] = ssid[random(65)];
-        packet[40] = ssid[random(65)];
-        packet[41] = ssid[random(65)];
-        packet[42] = ssid[random(65)];
-        packet[43] = ssid[random(65)];
-
-        packet[56] = channel;
-
-        esp_err_t result;
-        result = esp_wifi_80211_tx(WIFI_IF_AP, packet, 57, false);
+        esp_err_t result = esp_wifi_80211_tx(WIFI_IF_AP, frame, frameLen, false);
         if (result != ESP_OK) {
             Serial.printf("Packet 1 send failed: %d\n", result);
         }
-        result = esp_wifi_80211_tx(WIFI_IF_AP, packet, 57, false);
+        result = esp_wifi_80211_tx(WIFI_IF_AP, frame, frameLen, false);
         if (result != ESP_OK) {
             Serial.printf("Packet 2 send failed: %d\n", result);
         }
-        result = esp_wifi_80211_tx(WIFI_IF_AP, packet, 57, false);
+        result = esp_wifi_80211_tx(WIFI_IF_AP, frame, frameLen, false);
         if (result != ESP_OK) {
             Serial.printf("Packet 3 send failed: %d\n", result);
         }
@@ -1356,22 +1411,9 @@ void beaconSpamSetup() {
   lastSpamState   = !spam;
   spamDrawToolbarStatus();
 
-  esp_err_t err;
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  err = esp_wifi_init(&cfg);
-  if (err != ESP_OK) Serial.printf("WiFi init failed: %d\n", err);
-
-  err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-  if (err != ESP_OK) Serial.printf("Storage set failed: %d\n", err);
-
-  err = esp_wifi_set_mode(WIFI_MODE_AP);
-  if (err != ESP_OK) Serial.printf("Mode set failed: %d\n", err);
-
-  err = esp_wifi_start();
-  if (err != ESP_OK) Serial.printf("WiFi start failed: %d\n", err);
-
-  err = esp_wifi_set_promiscuous(true);
-  if (err != ESP_OK) Serial.printf("Promiscuous set failed: %d\n", err);
+  if (!beaconRadioEnsureReady(1)) {
+    return;
+  }
 
 #if HAS_PCF8574_BUTTONS
   pcf.pinMode(BTN_UP, INPUT_PULLUP);
